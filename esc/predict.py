@@ -108,6 +108,61 @@ def precision_recall_f1_accuracy_score(y_true: List[List[str]], y_pred: List[Opt
     return ScoresReport(precision, recall, f1)
 
 
+def predict_babelscape(
+    model: ESCModule, data_loader: DataLoader, prediction_type: str
+) -> PredictionReport:
+
+    instance_prediction_reports = []
+
+    with torch.no_grad(), torch.cuda.amp.autocast():
+
+        for batch in data_loader:
+
+            predictions = model(batch["sequences"], batch["attention_masks"])
+            for i, seq in enumerate(batch["sequences"]):
+                seq = seq.cpu().numpy().tolist()
+
+                si = predictions["start_predictions"][i]
+                ei = predictions["end_predictions"][i]
+                start_logits_i = predictions["start_logits"][i]
+                end_logits_i = predictions["end_logits"][i]
+
+                if "xlnet" in model.hparams.transformer_model or model.hparams.squad_head:
+                    ei = ei[0]
+                    end_logits_i = end_logits_i.T[0]
+
+                possible_offsets = batch["possible_offsets"][i]
+                glosses_indices = batch["gloss_positions"][i]
+                wsd_instance = None if "wsd_instances" not in batch else batch["wsd_instances"][i]
+
+                predicted_offsets = probabilistic_prediction(
+                    start_logits_i, end_logits_i, glosses_indices, possible_offsets, prediction_type
+                )
+
+                predicted_offsets_indices = [glosses_indices[possible_offsets.index(po)] for po in predicted_offsets]
+
+                gold_labels, gold_labels_indices = None, None
+
+                instance_prediction_report = InstancePredictionReport(
+                    sequence=seq,
+                    possible_synsets=possible_offsets,
+                    predicted_synsets=predicted_offsets,
+                    gold_synsets=gold_labels,
+                    predicted_synsets_indices=predicted_offsets_indices,
+                    gold_synsets_indices=gold_labels_indices,
+                    possible_synsets_indices=glosses_indices,
+                    most_probable_start_index=si,
+                    most_probable_end_index=ei,
+                    predicted_start_indices_logits=start_logits_i,
+                    predicted_end_indices_logits=end_logits_i,
+                    wsd_instance=wsd_instance,
+                )
+
+                instance_prediction_reports.append(instance_prediction_report)
+
+    return PredictionReport(instances_prediction_reports=instance_prediction_reports, scores_report=None)
+
+
 def predict(
     model: ESCModule, data_loader: DataLoader, device: int, prediction_type: str, evaluate: bool = False
 ) -> PredictionReport:

@@ -1,6 +1,9 @@
+import tempfile
 from typing import NamedTuple, Optional, List, Callable, Tuple, Iterable
 import xml.etree.cElementTree as ET
 from xml.dom import minidom
+
+from esc.utils.commons import execute_bash_command
 
 pos_map = {
     # U-POS
@@ -117,13 +120,17 @@ def expand_raganato_path(path: str) -> Tuple[str, str]:
 
 
 class RaganatoBuilder:
-    def __init__(self, lang: str, source: str):
+    def __init__(self, lang: Optional[str] = None, source: Optional[str] = None):
         self.corpus = ET.Element("corpus")
-        self.corpus.set("lang", lang)
-        self.corpus.set("source", source)
         self.current_text_section = None
         self.current_sentence_section = None
         self.gold_senses = []
+
+        if lang is not None:
+            self.corpus.set("lang", lang)
+
+        if source is not None:
+            self.corpus.set("source", source)
 
     def open_text_section(self, text_id: str, text_source: str = None):
         text_section = ET.SubElement(self.corpus, "text")
@@ -132,20 +139,29 @@ class RaganatoBuilder:
             text_section.set("source", text_source)
         self.current_text_section = text_section
 
-    def open_sentence_section(self, sentence_id: str):
+    def open_sentence_section(self, sentence_id: str, update_id: bool = True):
         sentence_section = ET.SubElement(self.current_text_section, "sentence")
-        sentence_id = self.compute_id([self.current_text_section.attrib["id"], sentence_id])
+        if update_id:
+            sentence_id = self.compute_id([self.current_text_section.attrib["id"], sentence_id])
         sentence_section.set("id", sentence_id)
         self.current_sentence_section = sentence_section
 
     def add_annotated_token(
-        self, token: str, lemma: str, pos: str, instance_id: Optional[str] = None, sense: Optional[str] = None
+        self,
+        token: str,
+        lemma: str,
+        pos: str,
+        instance_id: Optional[str] = None,
+        labels: Optional[List[str]] = None,
+        update_id: bool = False,
     ):
-        if instance_id is not None and sense is not None:
+        if instance_id is not None:
             token_element = ET.SubElement(self.current_sentence_section, "instance")
-            token_id = self.compute_id([self.current_sentence_section.attrib["id"], instance_id])
-            token_element.set("id", token_id)
-            self.gold_senses.append((token_id, sense))
+            if update_id:
+                instance_id = self.compute_id([self.current_sentence_section.attrib["id"], instance_id])
+            token_element.set("id", instance_id)
+            if labels is not None:
+                self.gold_senses.append((instance_id, " ".join(labels)))
         else:
             token_element = ET.SubElement(self.current_sentence_section, "wf")
         token_element.set("lemma", lemma)
@@ -156,19 +172,17 @@ class RaganatoBuilder:
     def compute_id(chain_ids: List[str]) -> str:
         return ".".join(chain_ids)
 
-    def store(self, data_output_path: str, labels_output_path: Optional[str]):
+    def store(self, data_output_path: str, labels_output_path: Optional[str]=None):
         self.__store_xml(data_output_path)
         if labels_output_path is not None:
             self.__store_labels(labels_output_path)
 
     def __store_xml(self, output_path: str):
         corpus_writer = ET.ElementTree(self.corpus)
-        with open(output_path, "wb") as f_xml:
-            corpus_writer.write(f_xml, encoding="UTF-8", xml_declaration=True)
-        dom = minidom.parse(output_path)
-        pretty_xml = dom.toprettyxml()
-        with open(output_path, "w") as f_xml:
-            f_xml.write(pretty_xml)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with open(f"{tmp_dir}/tmp.xml", "wb") as f_xml:
+                corpus_writer.write(f_xml, encoding="UTF-8", xml_declaration=True)
+            execute_bash_command(f" xmllint --format {tmp_dir}/tmp.xml > {output_path}")
 
     def __store_labels(self, output_path: str):
         with open(output_path, "w") as f_labels:

@@ -1,7 +1,7 @@
 import collections
 import random
 from abc import ABC, abstractmethod
-from typing import List, Union, Tuple, Dict, Any, Optional, NamedTuple
+from typing import List, Union, Tuple, Dict, Any, Optional, NamedTuple, Set
 
 import numpy as np
 import torch
@@ -10,6 +10,7 @@ from torch.distributions import poisson
 
 from esc.utils.definitions_tokenizer import DefinitionsTokenizer
 from esc.utils.commons import flatten, chunks, batch_data
+from esc.utils.kb_mamager import KBManager
 from esc.utils.wordnet import wn_offsets_from_lemmapos, synset_from_offset, wn_offset_from_sense_key
 from esc.utils.wsd import expand_raganato_path, read_from_raganato, pos_map, WSDInstance
 
@@ -397,6 +398,204 @@ class OxfordDictionaryDataset(QAExtractiveDataset):
             self.data_store.append(data_elem)
 
 
+class BabelNetDataset(QAExtractiveDataset):
+
+    dataset_id = "babelnet"
+
+    def __init__(
+        self,
+        raganato_path: Union[str, List[str]],
+        tokenizer: DefinitionsTokenizer,
+        tokens_per_batch: int,
+        re_init_on_iter: bool,
+        is_test: bool = False,
+        add_glosses_noise: bool = False,
+        fix_glosses: bool = False,
+        kshot: int = -1,
+        poisson_lambda: int = 1,
+        mappings_folder: str = None,
+        sensekey_to_bn_id: Dict[str, str] = None,
+        lemmapos_to_bn_ids: Dict[str, Set[str]] = None,
+        bnid_to_gloss: Dict[str, str] = None
+    ) -> None:
+
+        super().__init__(tokenizer, tokens_per_batch, re_init_on_iter, is_test)
+
+        self.data_paths, self.keys_paths = [], []
+        if type(raganato_path) == str:
+            dp, kp = expand_raganato_path(raganato_path)
+            self.data_paths.append(dp)
+            self.keys_paths.append(kp)
+        else:
+            for rp in raganato_path:
+                dp, kp = expand_raganato_path(rp)
+                self.data_paths.append(dp)
+                self.keys_paths.append(kp)
+
+        self.add_glosses_noise = add_glosses_noise
+        self.offsets_frequencies = None  # only used if the parameter "add_glosses_noise" is > 0.0
+        self.fix_glosses = fix_glosses
+        self.kshot = kshot
+        self.poisson = poisson.Poisson(poisson_lambda)
+
+        self.bn_manager = None
+        if mappings_folder is not None:
+            self.bn_manager = KBManager(mappings_folder)
+
+        else:
+            self.sensekey_to_bn_id = sensekey_to_bn_id
+            self.lemmapos_to_bn_id = lemmapos_to_bn_ids
+            self.bn_id_to_glosses = bnid_to_gloss
+
+
+    def __init_offsets_frequencies(self) -> None:
+
+        offsets_counter = collections.Counter()
+
+        for data_path, keys_path in zip(self.data_paths, self.keys_paths):
+            for _, _, wsd_sentence in read_from_raganato(data_path, keys_path):
+                for wsd_instance in wsd_sentence:
+                    if wsd_instance.labels is None:
+                        continue
+                    else:
+                        if self.bn_manager is not None:
+                            bn_offsets = [self.bn_manager.synset_offset_from_sense_key(_l) for _l in wsd_instance.labels]
+                        else:
+                            bn_offsets = [self.sensekey_to_bn_id[_l] for _l in wsd_instance.labels]
+
+                        offsets_counter.update(bn_offsets)
+
+        total_occurrences = sum(offsets_counter.values())
+
+        self.offsets_frequencies = [], []
+
+        for wn_offset, count in offsets_counter.items():
+            self.offsets_frequencies[0].append(wn_offset)
+            self.offsets_frequencies[1].append(count / total_occurrences)
+
+    def init_dataset(self) -> None:
+
+        self.data_store = []
+
+        if self.add_glosses_noise and self.offsets_frequencies is None:
+            self.__init_offsets_frequencies()
+
+        if self.kshot > 0:
+            senses_counter = collections.Counter()
+
+        for data_path, keys_path in zip(self.data_paths, self.keys_paths):
+
+            raganato_iterable = read_from_raganato(data_path, keys_path)
+            for _, _, wsd_sentence in raganato_iterable:
+
+                sentence_tokens = [wsd_instance.annotated_token.text for wsd_instance in wsd_sentence]
+
+                for i, wsd_instance in enumerate(wsd_sentence):
+
+                    if wsd_instance.instance_id is None:
+                        continue
+
+                    gold_labels, current_label = None, None
+                    if wsd_instance.labels is not None:
+                        if self.bn_manager is not None:
+                            gold_labels = [self.bn_manager.synset_offset_from_sense_key(_l) for _l in wsd_instance.labels]
+                        else:
+                            gold_labels = [self.sensekey_to_bn_id[_l] for _l in wsd_instance.labels]
+
+                        current_label = random.choice(gold_labels)
+
+                    if self.bn_manager is not None:
+                        possible_offsets = self.bn_manager.synset_offsets_from_lemmapos(
+                            wsd_instance.annotated_token.lemma,
+                            pos_map.get(wsd_instance.annotated_token.pos, wsd_instance.annotated_token.pos),
+                        )
+                    else:
+                        lemmapos = f"{wsd_instance.annotated_token.lemma}#" \
+                                   f"{pos_map.get(wsd_instance.annotated_token.pos, wsd_instance.annotated_token.pos)}"
+                        possible_offsets = self.lemmapos_to_bn_id[lemmapos]
+                        possible_offsets = [po for po in possible_offsets if po in self.bn_id_to_glosses]
+
+                    if len(possible_offsets) == 0:
+                        print(
+                            f"No synsets found in BabelNet for instance {wsd_instance.instance_id}. "
+                            f"Skipping this instance"
+                        )
+                        print(wsd_instance)
+                        continue
+
+                    if not self.is_test:
+
+                        # kshot
+                        if self.kshot > 0:
+                            if any([senses_counter[sk] > self.kshot for sk in wsd_instance.labels]):
+                                continue
+                            else:
+                                senses_counter.update(wsd_instance.labels)
+
+                        # randomly add glosses from other senses
+                        if self.add_glosses_noise:
+                            n_offsets_to_add = self.poisson.sample().item()
+                            offsets, frequencies = self.offsets_frequencies
+                            random_offsets = np.random.choice(
+                                offsets, size=int(n_offsets_to_add), replace=False, p=frequencies
+                            )
+                            possible_offsets += random_offsets.tolist()
+
+                        # remove gold glosses for multilabel instances
+                        possible_offsets = [
+                            po for po in possible_offsets if po == current_label or po not in gold_labels
+                        ]
+
+                        # remove possible duplicates
+                        possible_offsets = list(set(possible_offsets))
+
+                        if not self.fix_glosses:
+                            np.random.shuffle(possible_offsets)
+
+                    curr_sentence = self.tokenizer.insert_classify_tokens(sentence_tokens, index=i)
+
+                    if self.bn_manager is not None:
+                        possible_glosses = [
+                            self.bn_manager.gloss_from_offset(po).capitalize() + "." for po in possible_offsets
+                        ]
+                    else:
+                        possible_glosses = [
+                            self.bn_id_to_glosses[po].capitalize() + "." for po in possible_offsets
+                        ]
+
+                    encoded_final_sequence, gloss_positions, token_type_ids = self.tokenizer.prepare_sample(
+                        curr_sentence, possible_glosses
+                    )
+
+                    start_position, end_position = None, None
+                    if current_label is not None:
+                        try:
+                            label_idx = possible_offsets.index(current_label)
+                        except ValueError:
+                            print(
+                                f"Instance {wsd_instance.instance_id} label ({current_label}) is not a valid label "
+                                f"for BabelNet given its lemma ({wsd_instance.annotated_token.lemma}) "
+                                f"and pos ({wsd_instance.annotated_token.pos}. "
+                                f"Skipping this instance"
+                            )
+                            continue
+
+                        start_position, end_position = gloss_positions[label_idx]
+
+                    data_elem = DataElement(
+                        encoded_final_sequence=encoded_final_sequence,
+                        start_position=start_position,
+                        end_position=end_position,
+                        possible_offsets=possible_offsets,
+                        gold_labels=gold_labels,
+                        gloss_positions=gloss_positions,
+                        token_type_ids=token_type_ids,
+                        wsd_instance=wsd_instance,
+                    )
+
+                    self.data_store.append(data_elem)
+
+
 class DatasetAlternator(IterableDataset):
     def __init__(self, datasets: List[IterableDataset], is_infinite: bool = False):
         self.datasets = {dataset.__class__.__name__: dataset for dataset in datasets}
@@ -478,3 +677,5 @@ class SmartDatasetAlternator(IterableDataset):
                 yield next_batch
             else:
                 break
+
+

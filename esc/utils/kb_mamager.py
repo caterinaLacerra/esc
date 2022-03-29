@@ -48,7 +48,6 @@ def build_wordnet_dict(output_dir_path: str) -> None:
     write_dict_on_file(f"{output_dir_path}/lemmapos2synsets.tsv", lemmapos2synsets, value_mapper=lambda v: "\t".join(v))
     write_dict_on_file(f"{output_dir_path}/synset2sensekeys.tsv", synset2sensekeys, value_mapper=lambda v: "\t".join(v))
 
-
 class KBManager:
     def __init__(self, dictionaries_dir: str) -> None:
         self.sensekey2synset = dict()
