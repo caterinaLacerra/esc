@@ -16,6 +16,7 @@ from esc.utils.wsd import expand_raganato_path, read_from_raganato, pos_map, WSD
 
 ROBERTA_TOKENIZER_MODELS = {"roberta", "bart", "longformer"}
 
+random.seed(42)
 
 class DataElement(NamedTuple):
     encoded_final_sequence: torch.LongTensor
@@ -49,7 +50,7 @@ class QAExtractiveDataset(IterableDataset, ABC):
     def clean_dataset(self):
 
         old_len = len(self.data_store)
-
+        print([elem.encoded_final_sequence.size(0) for elem in self.data_store])
         self.data_store = [
             elem
             for elem in self.data_store
@@ -509,11 +510,18 @@ class BabelNetDataset(QAExtractiveDataset):
                             wsd_instance.annotated_token.lemma,
                             pos_map.get(wsd_instance.annotated_token.pos, wsd_instance.annotated_token.pos),
                         )
+                    
                     else:
                         lemmapos = f"{wsd_instance.annotated_token.lemma}#" \
                                    f"{pos_map.get(wsd_instance.annotated_token.pos, wsd_instance.annotated_token.pos)}"
-                        possible_offsets = self.lemmapos_to_bn_id[lemmapos]
-                        possible_offsets = [po for po in possible_offsets if po in self.bn_id_to_glosses]
+                 
+                        if lemmapos in self.lemmapos_to_bn_id:
+                            possible_offsets = self.lemmapos_to_bn_id[lemmapos]
+                        
+                        else:
+                            possible_offsets = []
+
+                    possible_offsets = [po for po in possible_offsets if po in self.bn_id_to_glosses]
 
                     if len(possible_offsets) == 0:
                         print(
@@ -522,6 +530,9 @@ class BabelNetDataset(QAExtractiveDataset):
                         )
                         print(wsd_instance)
                         continue
+
+                    if len(possible_offsets) > 25:
+                        possible_offsets = random.sample(possible_offsets, k=25)
 
                     if not self.is_test:
 
@@ -562,7 +573,7 @@ class BabelNetDataset(QAExtractiveDataset):
                         possible_glosses = [
                             self.bn_id_to_glosses[po].capitalize() + "." for po in possible_offsets
                         ]
-
+                    print([len(x) for x in possible_glosses], len(possible_glosses))
                     encoded_final_sequence, gloss_positions, token_type_ids = self.tokenizer.prepare_sample(
                         curr_sentence, possible_glosses
                     )
